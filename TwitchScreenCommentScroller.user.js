@@ -3,7 +3,7 @@
 // @namespace   page.loupe.tsscf
 // @description Twitch のコメントをニコニコ風にスクロールさせます。
 // @match       https://www.twitch.tv/*
-// @version     0.7.7
+// @version     0.7.8
 // @grant       GM_registerMenuCommand
 // @grant       GM_getValue
 // @grant       GM_setValue
@@ -31,6 +31,7 @@
     fontFamily: "Meiryo",
     maxLines: 10,
     duration: 5,
+    verticalMargin: 12,
     showStamps: true,
     emojiSize: 1.5,
     emojiLimit: 10,
@@ -414,11 +415,7 @@
       // 破棄するコメントのスプライトはプールへ返し、カウンタもリセットする。
       core.releaseAllSprites();
       activeCommentTotal = 0;
-      const rowHeight = Math.max(1, laneHeight);
-      const availableRows = Math.max(
-        1,
-        Math.floor(viewport.height / rowHeight),
-      );
+      const availableRows = availableLaneCount();
       const targetLines =
         config.maxLines === 0
           ? availableRows
@@ -442,11 +439,7 @@
         return;
       }
       const newWidth = viewport.width;
-      const rowHeight = Math.max(1, laneHeight);
-      const availableRows = Math.max(
-        1,
-        Math.floor(viewport.height / rowHeight),
-      );
+      const availableRows = availableLaneCount();
       const targetLines =
         config.maxLines === 0
           ? availableRows
@@ -471,7 +464,7 @@
 
       const durationMs = config.duration * 1000;
       for (let index = 0; index < lines.length; index += 1) {
-        const rowTop = laneHeight * index;
+        const rowTop = laneAreaTop() + laneHeight * index;
         for (const record of lines[index]) {
           const oldTrackWidth = oldViewport.width + record.width;
           const progress = Math.min(
@@ -650,7 +643,7 @@
             previous.pixelsPerMs < record.pixelsPerMs);
         if (!rowIsAvailable) continue;
 
-        record.rowTop = laneHeight * index;
+        record.rowTop = laneAreaTop() + laneHeight * index;
         record.top =
           record.rowTop +
           (laneHeight - textAscent - textDescent) / 2 +
@@ -958,11 +951,21 @@
       // 前フレームの行と今フレームの行を消す。合併用の Set は作らず、
       // 重複行は片側だけで消して二重消去を避ける。
       for (const index of dirtyRows) {
-        context.clearRect(0, index * laneHeight, viewport.width, laneHeight);
+        context.clearRect(
+          0,
+          laneAreaTop() + index * laneHeight,
+          viewport.width,
+          laneHeight,
+        );
       }
       for (const index of frameActiveRows) {
         if (dirtyRows.has(index)) continue;
-        context.clearRect(0, index * laneHeight, viewport.width, laneHeight);
+        context.clearRect(
+          0,
+          laneAreaTop() + index * laneHeight,
+          viewport.width,
+          laneHeight,
+        );
       }
     },
 
@@ -1244,6 +1247,12 @@
           { min: 0, max: 200, step: 1 },
         ],
         [
+          "verticalMargin",
+          "上下マージン（px、動画の上下端から開ける余白）",
+          "number",
+          { min: 0, max: 200, step: 1 },
+        ],
+        [
           "duration",
           "スクロール秒数",
           "number",
@@ -1410,6 +1419,21 @@
     else input.value = config[name];
     label.append(text, input);
     return label;
+  }
+
+  // レーンを配置する領域の上端 (動画の上端から開けるマージン)。
+  function laneAreaTop() {
+    return config.verticalMargin;
+  }
+
+  // 上下マージンを除いた内側の高さに収まるレーン数。
+  function availableLaneCount() {
+    const rowHeight = Math.max(1, laneHeight);
+    const innerHeight = Math.max(
+      0,
+      viewport.height - config.verticalMargin * 2,
+    );
+    return Math.max(1, Math.floor(innerHeight / rowHeight));
   }
 
   function applyDrawingSettings() {
@@ -1610,6 +1634,13 @@
       maxLines: numberSetting(
         raw.maxLines,
         DEFAULT_SETTINGS.maxLines,
+        0,
+        200,
+        true,
+      ),
+      verticalMargin: numberSetting(
+        raw.verticalMargin,
+        DEFAULT_SETTINGS.verticalMargin,
         0,
         200,
         true,
