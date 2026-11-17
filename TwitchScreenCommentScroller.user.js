@@ -1,9 +1,16 @@
 // ==UserScript==
 // @name        Twitch Screen Comment Scroller Custom 2
-// @namespace   page.loupe.tsscf
+// @namespace   masamasa1029
 // @description Twitch のコメントをニコニコ風にスクロールさせます。
 // @match       https://www.twitch.tv/*
-// @version     0.7.8
+// @version     0.8.0
+// 原作: knoa (kona) さんの "Twitch Screen Comment Scroller"
+//   https://greasyfork.org/ja/scripts/376225
+// 本スクリプトは、その改修版 "Twitch Screen Comment Scroller(fix)"
+// (page.loupe) を土台に改変したものです。
+//   https://greasyfork.org/scripts/458513-twitch-screen-comment-scroller-fix
+// @updateURL   https://raw.githubusercontent.com/masamasa1029/TwitchScreenCommentScroller/main/TwitchScreenCommentScroller.user.js
+// @downloadURL https://raw.githubusercontent.com/masamasa1029/TwitchScreenCommentScroller/main/TwitchScreenCommentScroller.user.js
 // @grant       GM_registerMenuCommand
 // @grant       GM_getValue
 // @grant       GM_setValue
@@ -759,6 +766,13 @@
         ) {
           images += 1;
           const size = fontSize * config.emojiSize;
+          // 表示の高さは size に固定し、幅は元画像のアスペクト比から
+          // 決める (正方形に引き伸ばすと横長・縦長の画像が潰れるため)。
+          // チャット側の img は表示済みで自然サイズが分かることが多い。
+          const aspect =
+            node.naturalWidth && node.naturalHeight
+              ? node.naturalWidth / node.naturalHeight
+              : 1;
           // チャットDOMの img 要素そのものは保持しない。
           // 仮想スクロールで要素が再利用・除去されても化けないよう、
           // URL を控えて自前の Image へ読み直す。解像度は srcset に任せる。
@@ -776,33 +790,77 @@
           // 別URLとしてキャッシュすると、1コメントでキャッシュが
           // 埋まって追い出しが起きるため、キーには使わない。
           const stampUrl = source.split("#")[0];
+          const displayWidth = stampDisplayWidth(size, aspect);
           parts.push({
             type: "image",
             image,
             url: stampUrl,
             alt: node.alt || "",
-            width: size,
+            width: displayWidth,
             size,
+            aspect,
             offset: runningOffset,
             animated,
           });
           // アニメーション候補は、裏でフレームのデコードを開始しておく。
           if (animated) loadAnimatedStampFrames(stampUrl);
-          runningOffset += size;
+          runningOffset += displayWidth;
         }
         node = walker.nextNode();
       }
       return parts;
     },
 
+    // 読み込み済みの画像があれば、その自然サイズからアスペクト比を
+    // 確定して表示幅へ反映する。取り込み時点で比率が分からなかった
+    // 画像 (読み込み中だったもの) のための後追い処理。
+    syncImageAspects(record) {
+      let changed = false;
+      for (const part of record.parts) {
+        if (part.type !== "image") continue;
+        if (
+          !part.image.complete ||
+          !part.image.naturalWidth ||
+          !part.image.naturalHeight
+        )
+          continue;
+        const aspect = part.image.naturalWidth / part.image.naturalHeight;
+        if (Math.abs(aspect - part.aspect) > 0.01) {
+          part.aspect = aspect;
+          part.width = stampDisplayWidth(part.size, aspect);
+          changed = true;
+        }
+      }
+      if (changed) core.relayoutRecord(record);
+    },
+
+    // 部品幅の変化に合わせて、部品オフセットとコメント全体の幅・
+    // 速度・残り時間を計算し直す (現在位置はそのまま維持する)。
+    relayoutRecord(record) {
+      let offset = 0;
+      for (const part of record.parts) {
+        part.offset = offset;
+        offset += part.width;
+      }
+      if (offset === record.width) return;
+      record.width = offset;
+      const durationMs = config.duration * 1000;
+      record.pixelsPerMs = (viewport.width + record.width) / durationMs;
+      record.reveal =
+        (record.left + record.width - viewport.width) / record.pixelsPerMs;
+      record.touch = record.left / record.pixelsPerMs;
+      record.life = (record.left + record.width) / record.pixelsPerMs;
+    },
+
     rasterizeComment(record) {
+      core.syncImageAspects(record);
       const previousSprite = record.sprite;
       record.sprite = core.createCommentSprite(record);
       if (previousSprite) core.releaseSprite(previousSprite);
       if (record.imageLoadBound) return;
       record.imageLoadBound = true;
-      // 静止画スタンプだけを監視する。アニメーションスタンプは毎フレーム
-      // 直接描画するため、読み込み完了を待つ必要がない。
+      // 画像の読み込み完了を監視する。静止画はスプライトの焼き直し、
+      // アニメーションスタンプは表示幅 (アスペクト比) の確定が目的。
       // 複数画像が相次いで読み込まれても、再ラスタライズは rAF で
       // フレームあたり1回にまとめる。
       const scheduleRebuild = () => {
@@ -814,10 +872,7 @@
         });
       };
       record.parts
-        .filter(
-          (part) =>
-            part.type === "image" && !part.animated && !part.image.complete,
-        )
+        .filter((part) => part.type === "image" && !part.image.complete)
         .forEach((part) => {
           part.image.addEventListener("load", scheduleRebuild, { once: true });
           part.image.addEventListener("error", scheduleRebuild, { once: true });
@@ -864,7 +919,7 @@
               part.image,
               left,
               (height - part.size) / 2,
-              part.size,
+              part.width,
               part.size,
             );
           }
@@ -1053,10 +1108,10 @@
             }
             elapsedInLoop -= candidate.duration;
           }
-          context.drawImage(frame.image, left, top, part.size, part.size);
+          context.drawImage(frame.image, left, top, part.width, part.size);
         } else if (part.image.complete && part.image.naturalWidth) {
           // デコード前・失敗時は従来どおり Image をそのまま描く (静止画化)。
-          context.drawImage(part.image, left, top, part.size, part.size);
+          context.drawImage(part.image, left, top, part.width, part.size);
         }
       }
     },
@@ -1424,6 +1479,14 @@
   // レーンを配置する領域の上端 (動画の上端から開けるマージン)。
   function laneAreaTop() {
     return config.verticalMargin;
+  }
+
+  // スタンプ画像の表示幅。表示の高さ (size) を基準に、元画像の
+  // アスペクト比 (横÷縦) から決める。極端に横長・縦長の画像で
+  // レイアウトが崩れないよう、比率は 0.25〜4 の範囲に丸める。
+  function stampDisplayWidth(size, aspect) {
+    const clampedAspect = Math.min(4, Math.max(0.25, aspect || 1));
+    return size * clampedAspect;
   }
 
   // 上下マージンを除いた内側の高さに収まるレーン数。
