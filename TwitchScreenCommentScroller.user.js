@@ -3,7 +3,7 @@
 // @namespace   masamasa1029
 // @description Twitch のコメントをニコニコ風にスクロールさせます。
 // @match       https://www.twitch.tv/*
-// @version     0.8.2
+// @version     0.8.3
 // 原作: knoa (kona) さんの "Twitch Screen Comment Scroller"
 //   https://greasyfork.org/ja/scripts/376225
 // 本スクリプトは、その改修版 "Twitch Screen Comment Scroller(fix)"
@@ -48,6 +48,7 @@
     show: true,
     placement: "center",
     overflowMode: "drop",
+    overflowGraceSec: 2,
     maxActiveComments: 0,
     maxCommentsPerLane: 0,
     minLaneInterval: 0,
@@ -631,6 +632,7 @@
         pixelsPerMs: 0,
         reveal: 0,
         touch: 0,
+        queuedAt: 0,
         top: 0,
         sprite: null,
         imageLoadBound: false,
@@ -641,20 +643,26 @@
       };
 
       const now = performance.now();
-      if (
-        core.tryPlaceComment(record, now, config.overflowMode === "overlap")
-      )
-        return;
+      if (core.tryPlaceComment(record, now, false)) return;
 
-      if (config.overflowMode === "wait") {
-        // 「空くまで待つ」: 待ち行列へ入れ、毎フレーム再試行する
-        // (placePendingComments)。上限を超えた分は古いものから捨てる。
+      if (config.overflowMode === "overlap" && config.overflowGraceSec <= 0) {
+        // 猶予なしの「重ねて流す」は、その場で重ね配置を試みる。
+        if (core.tryPlaceComment(record, now, true)) return;
+      }
+
+      if (config.overflowMode === "wait" || config.overflowGraceSec > 0) {
+        // 「空くまで待つ」、または猶予つきの「捨てる／重ねて流す」:
+        // 待ち行列へ入れて毎フレーム再試行する (placePendingComments)。
+        // 猶予を過ぎても置けないときの扱いは overflowMode に従う。
+        // 上限を超えた分は古いものから捨てる。
+        record.queuedAt = now;
         pendingComments.push(record);
         if (pendingComments.length > PENDING_COMMENTS_LIMIT)
           pendingComments.shift();
         core.startAnimation();
+        return;
       }
-      // "drop" のときはここで破棄される (従来通りの間引き)。
+      // 猶予なしの "drop" のときはここで破棄される (従来通りの間引き)。
     },
 
     // コメントのレーン配置を試みる。配置できたら true。
@@ -733,19 +741,36 @@
       return true;
     },
 
-    // 「空くまで待つ」の待ち行列から、置けるようになったコメントを
-    // 先頭から順にレーンへ出す。先頭が置けなければ後ろも待たせる
-    // (順番を保つため)。同時表示数の上限もここで守る。
+    // 待ち行列から、置けるようになったコメントを先頭から順にレーンへ
+    // 出す。先頭が置けなければ後ろも待たせる (順番を保つため)。
+    // overflowMode が "wait" のときは空くまで待ち続ける。"drop" /
+    // "overlap" のときは overflowGraceSec の猶予だけ待ち、過ぎたら
+    // 捨てる／重ねて流す。同時表示数の上限もここで守る。
     placePendingComments() {
       if (!pendingComments.length) return;
       const now = performance.now();
+      const graceMillis = config.overflowGraceSec * 1000;
       while (pendingComments.length) {
         if (
           config.maxActiveComments > 0 &&
           core.activeCommentCount() >= config.maxActiveComments
         )
           break;
-        if (!core.tryPlaceComment(pendingComments[0], now, false)) break;
+        const record = pendingComments[0];
+        if (core.tryPlaceComment(record, now, false)) {
+          pendingComments.shift();
+          continue;
+        }
+        if (config.overflowMode === "wait") break;
+        if (now - record.queuedAt < graceMillis) break;
+        // 猶予を過ぎた先頭コメントを、モードに従って処分する。
+        if (config.overflowMode === "drop") {
+          pendingComments.shift();
+          continue;
+        }
+        // "overlap": 重ね配置でも入らない (全レーンが最大数) ときは、
+        // あきらめず次フレームで再試行する。
+        if (!core.tryPlaceComment(record, now, true)) break;
         pendingComments.shift();
       }
     },
@@ -1454,6 +1479,12 @@
           },
         ],
         [
+          "overflowGraceSec",
+          "捨てる／重ねるまでの猶予（秒）",
+          "number",
+          { min: 0, max: 5, step: 0.5 },
+        ],
+        [
           "maxActiveComments",
           "同時表示数（0＝制限なし）",
           "number",
@@ -1851,6 +1882,12 @@
         raw.overflowMode,
         DEFAULT_SETTINGS.overflowMode,
         ["drop", "overlap", "wait"],
+      ),
+      overflowGraceSec: numberSetting(
+        raw.overflowGraceSec,
+        DEFAULT_SETTINGS.overflowGraceSec,
+        0,
+        5,
       ),
       maxActiveComments: numberSetting(
         raw.maxActiveComments,
