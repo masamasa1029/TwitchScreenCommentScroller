@@ -3,7 +3,7 @@
 // @namespace   masamasa1029
 // @description Twitch のコメントをニコニコ風にスクロールさせます。
 // @match       https://www.twitch.tv/*
-// @version     0.8.1
+// @version     0.8.2
 // 原作: knoa (kona) さんの "Twitch Screen Comment Scroller"
 //   https://greasyfork.org/ja/scripts/376225
 // 本スクリプトは、その改修版 "Twitch Screen Comment Scroller(fix)"
@@ -81,6 +81,11 @@
   let laneCursor = 0;
   // 描画中コメントの総数。毎回 lines を数え直さずカウンタで管理する。
   let activeCommentTotal = 0;
+  // 「空くまで待つ」(overflowMode = "wait") の待ち行列。レーンへ
+  // 入らなかったコメントを保持し、毎フレーム配置を再試行する。
+  const pendingComments = [];
+  // 待ち行列の上限。超えた分は古いものから捨てる。
+  const PENDING_COMMENTS_LIMIT = 80;
   // レーン選択順を入れる使い回しバッファ。コメント追加のたびの配列生成を避ける。
   let laneOrderBuffer = [];
   // 前フレームで描いた行 (消去対象) と今フレームで描く行。2つの Set を交換して使い回す。
@@ -423,6 +428,7 @@
       // 破棄するコメントのスプライトはプールへ返し、カウンタもリセットする。
       core.releaseAllSprites();
       activeCommentTotal = 0;
+      pendingComments.length = 0;
       const availableRows = availableLaneCount();
       const targetLines =
         config.maxLines === 0
@@ -614,16 +620,17 @@
       const width = parts.reduce((total, part) => total + part.width, 0);
       if (!width || !Number.isFinite(width)) return;
 
-      const durationMs = config.duration * 1000;
-      const pixelsPerMs = (viewport.width + width) / durationMs;
+      // 速度と寿命 (pixelsPerMs / life / reveal / touch) は、配置が
+      // 決まる時点で tryPlaceComment が計算する。待ち行列で待つ間に
+      // リサイズがあっても、置かれた時点の画面幅で計算される。
       const record = {
         parts,
         width,
-        life: durationMs,
+        life: 0,
         left: viewport.width,
-        pixelsPerMs,
-        reveal: width / pixelsPerMs,
-        touch: viewport.width / pixelsPerMs,
+        pixelsPerMs: 0,
+        reveal: 0,
+        touch: 0,
         top: 0,
         sprite: null,
         imageLoadBound: false,
@@ -634,8 +641,39 @@
       };
 
       const now = performance.now();
-      // 指定レーンへ実際に配置する処理。通常配置と、埋まったときの
-      // 重ね配置 (overflowMode = "overlap") で共用する。
+      if (
+        core.tryPlaceComment(record, now, config.overflowMode === "overlap")
+      )
+        return;
+
+      if (config.overflowMode === "wait") {
+        // 「空くまで待つ」: 待ち行列へ入れ、毎フレーム再試行する
+        // (placePendingComments)。上限を超えた分は古いものから捨てる。
+        pendingComments.push(record);
+        if (pendingComments.length > PENDING_COMMENTS_LIMIT)
+          pendingComments.shift();
+        core.startAnimation();
+      }
+      // "drop" のときはここで破棄される (従来通りの間引き)。
+    },
+
+    // コメントのレーン配置を試みる。配置できたら true。
+    // allowOverlap が true で通常配置が全滅したときは、一番早く空く
+    // レーン (最後のコメントの残り寿命が一番短いレーン) へ重ねて流す。
+    // 衝突回避と最小投入間隔は重ね配置では無視するが、レーンごとの
+    // 最大数だけは上限として守る。
+    tryPlaceComment(record, now, allowOverlap) {
+      // 速度と寿命は、配置を試みる時点の画面幅と設定で計算する。
+      // 衝突回避の判定が record.pixelsPerMs / touch を参照するため、
+      // レーン走査より前に済ませる。再試行のたびに計算し直すので、
+      // 待ち行列で待つ間にリサイズがあっても置かれた時点の値になる。
+      const durationMs = config.duration * 1000;
+      record.left = viewport.width;
+      record.pixelsPerMs = (viewport.width + record.width) / durationMs;
+      record.life = durationMs;
+      record.reveal = record.width / record.pixelsPerMs;
+      record.touch = viewport.width / record.pixelsPerMs;
+
       const placeIntoLane = (index) => {
         record.rowTop = laneAreaTop() + laneHeight * index;
         record.top =
@@ -669,36 +707,47 @@
         if (!rowIsAvailable) continue;
 
         placeIntoLane(index);
-        return;
+        return true;
       }
 
-      if (config.overflowMode === "overlap") {
-        // 全レーンが埋まっていても捨てず、一番早く空くレーン
-        // (最後のコメントの残り寿命が一番短いレーン) へ重ねて流す。
-        // 衝突回避と最小投入間隔は無視するが、レーンごとの最大数
-        // だけは上限として守る。
-        let bestIndex = -1;
-        let bestRemainingLife = Infinity;
-        for (let index = 0; index < lines.length; index += 1) {
-          const row = lines[index];
-          if (
-            config.maxCommentsPerLane > 0 &&
-            row.length >= config.maxCommentsPerLane
-          )
-            continue;
-          const previous = row.at(-1);
-          const remainingLife = previous ? previous.life : 0;
-          if (remainingLife < bestRemainingLife) {
-            bestRemainingLife = remainingLife;
-            bestIndex = index;
-          }
-        }
-        if (bestIndex >= 0) {
-          placeIntoLane(bestIndex);
-          return;
+      if (!allowOverlap) return false;
+
+      let bestIndex = -1;
+      let bestRemainingLife = Infinity;
+      for (let index = 0; index < lines.length; index += 1) {
+        const row = lines[index];
+        if (
+          config.maxCommentsPerLane > 0 &&
+          row.length >= config.maxCommentsPerLane
+        )
+          continue;
+        const previous = row.at(-1);
+        const remainingLife = previous ? previous.life : 0;
+        if (remainingLife < bestRemainingLife) {
+          bestRemainingLife = remainingLife;
+          bestIndex = index;
         }
       }
-      // 全レーンが埋まったコメントは意図的に捨て、キューを無制限に増やさない。
+      if (bestIndex < 0) return false;
+      placeIntoLane(bestIndex);
+      return true;
+    },
+
+    // 「空くまで待つ」の待ち行列から、置けるようになったコメントを
+    // 先頭から順にレーンへ出す。先頭が置けなければ後ろも待たせる
+    // (順番を保つため)。同時表示数の上限もここで守る。
+    placePendingComments() {
+      if (!pendingComments.length) return;
+      const now = performance.now();
+      while (pendingComments.length) {
+        if (
+          config.maxActiveComments > 0 &&
+          core.activeCommentCount() >= config.maxActiveComments
+        )
+          break;
+        if (!core.tryPlaceComment(pendingComments[0], now, false)) break;
+        pendingComments.shift();
+      }
     },
 
     getLaneOrder() {
@@ -1014,7 +1063,8 @@
     },
 
     shouldAnimate() {
-      return core.hasActiveComments();
+      // 待ち行列に残りがあれば、表示中がゼロでも再試行のために回し続ける。
+      return core.hasActiveComments() || pendingComments.length > 0;
     },
 
     clearCanvas() {
@@ -1098,6 +1148,8 @@
       const previousDirtyRows = dirtyRows;
       dirtyRows = frameActiveRows;
       frameActiveRows = previousDirtyRows;
+      // 空いたレーンへ、待ち行列のコメントを順に出す。
+      core.placePendingComments();
     },
 
     drawComment(record) {
@@ -1397,6 +1449,7 @@
             options: [
               ["drop", "捨てる"],
               ["overlap", "重ねて流す"],
+              ["wait", "空くまで待つ"],
             ],
           },
         ],
@@ -1797,7 +1850,7 @@
       overflowMode: optionSetting(
         raw.overflowMode,
         DEFAULT_SETTINGS.overflowMode,
-        ["drop", "overlap"],
+        ["drop", "overlap", "wait"],
       ),
       maxActiveComments: numberSetting(
         raw.maxActiveComments,
