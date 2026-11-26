@@ -3,7 +3,7 @@
 // @namespace   masamasa1029
 // @description Twitch のコメントをニコニコ風にスクロールさせます。
 // @match       https://www.twitch.tv/*
-// @version     0.8.0
+// @version     0.8.1
 // 原作: knoa (kona) さんの "Twitch Screen Comment Scroller"
 //   https://greasyfork.org/ja/scripts/376225
 // 本スクリプトは、その改修版 "Twitch Screen Comment Scroller(fix)"
@@ -47,6 +47,7 @@
     autoPrimeCollapsedChat: true,
     show: true,
     placement: "center",
+    overflowMode: "drop",
     maxActiveComments: 0,
     maxCommentsPerLane: 0,
     minLaneInterval: 0,
@@ -633,6 +634,23 @@
       };
 
       const now = performance.now();
+      // 指定レーンへ実際に配置する処理。通常配置と、埋まったときの
+      // 重ね配置 (overflowMode = "overlap") で共用する。
+      const placeIntoLane = (index) => {
+        record.rowTop = laneAreaTop() + laneHeight * index;
+        record.top =
+          record.rowTop +
+          (laneHeight - textAscent - textDescent) / 2 +
+          textAscent;
+        core.rasterizeComment(record);
+        lines[index].push(record);
+        activeCommentTotal += 1;
+        laneLastAddedAt[index] = now;
+        if (config.placement === "spread")
+          laneCursor = (index + 1) % lines.length;
+        core.startAnimation();
+      };
+
       for (const index of core.getLaneOrder()) {
         const row = lines[index];
         const previous = row.at(-1);
@@ -650,19 +668,35 @@
             previous.pixelsPerMs < record.pixelsPerMs);
         if (!rowIsAvailable) continue;
 
-        record.rowTop = laneAreaTop() + laneHeight * index;
-        record.top =
-          record.rowTop +
-          (laneHeight - textAscent - textDescent) / 2 +
-          textAscent;
-        core.rasterizeComment(record);
-        row.push(record);
-        activeCommentTotal += 1;
-        laneLastAddedAt[index] = now;
-        if (config.placement === "spread")
-          laneCursor = (index + 1) % lines.length;
-        core.startAnimation();
+        placeIntoLane(index);
         return;
+      }
+
+      if (config.overflowMode === "overlap") {
+        // 全レーンが埋まっていても捨てず、一番早く空くレーン
+        // (最後のコメントの残り寿命が一番短いレーン) へ重ねて流す。
+        // 衝突回避と最小投入間隔は無視するが、レーンごとの最大数
+        // だけは上限として守る。
+        let bestIndex = -1;
+        let bestRemainingLife = Infinity;
+        for (let index = 0; index < lines.length; index += 1) {
+          const row = lines[index];
+          if (
+            config.maxCommentsPerLane > 0 &&
+            row.length >= config.maxCommentsPerLane
+          )
+            continue;
+          const previous = row.at(-1);
+          const remainingLife = previous ? previous.life : 0;
+          if (remainingLife < bestRemainingLife) {
+            bestRemainingLife = remainingLife;
+            bestIndex = index;
+          }
+        }
+        if (bestIndex >= 0) {
+          placeIntoLane(bestIndex);
+          return;
+        }
       }
       // 全レーンが埋まったコメントは意図的に捨て、キューを無制限に増やさない。
     },
@@ -1356,6 +1390,17 @@
           },
         ],
         [
+          "overflowMode",
+          "レーンが埋まっているとき",
+          "select",
+          {
+            options: [
+              ["drop", "捨てる"],
+              ["overlap", "重ねて流す"],
+            ],
+          },
+        ],
+        [
           "maxActiveComments",
           "同時表示数（0＝制限なし）",
           "number",
@@ -1749,6 +1794,11 @@
         "top",
         "bottom",
       ]),
+      overflowMode: optionSetting(
+        raw.overflowMode,
+        DEFAULT_SETTINGS.overflowMode,
+        ["drop", "overlap"],
+      ),
       maxActiveComments: numberSetting(
         raw.maxActiveComments,
         DEFAULT_SETTINGS.maxActiveComments,
